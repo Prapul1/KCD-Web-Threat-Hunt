@@ -1,0 +1,161 @@
+########################################################################
+# KCD-Web Threat Hunt — All SPL Queries, in investigation order
+# Index: main | Sourcetype: csv | Source: G:\KCD.csv-2026-4-8 14.52.1.csv
+# Data was ingested via a Splunk Universal Forwarder (file too large
+# for direct web-UI upload to Splunk Cloud).
+########################################################################
+
+########################################
+# PHASE 1 — Baseline Understanding
+########################################
+
+# 1.1 EventCode distribution
+index="main" source="G:\\KCD.csv-2026-4-8 14.52.1.csv"
+| stats count by EventCode
+| sort - count
+
+# 1.2 DestinationIp distribution
+index="main" source="G:\\KCD.csv-2026-4-8 14.52.1.csv" EventCode=3
+| stats count by DestinationIp
+| sort - count
+
+
+########################################
+# PHASE 2 — Noise Filtering
+########################################
+
+# 2.1 Exclude internal IPs
+index="main" source="G:\\KCD.csv-2026-4-8 14.52.1.csv" EventCode=3
+NOT (DestinationIp IN ("172.16.1.7", "127.0.0.1"))
+| stats count values(Image) as Process values(DestinationPort) as Ports by DestinationIp
+| sort - count
+
+# 2.2 CIDR-based internal/external tagging
+index="main" source="G:\\KCD.csv-2026-4-8 14.52.1.csv" EventCode=3
+| eval IP_Type = case(
+    cidrmatch("10.0.0.0/8", DestinationIp), "Internal",
+    cidrmatch("172.16.0.0/12", DestinationIp), "Internal",
+    cidrmatch("192.168.0.0/16", DestinationIp), "Internal",
+    cidrmatch("127.0.0.0/8", DestinationIp), "Localhost",
+    true(), "External"
+)
+| search IP_Type="External"
+| stats count values(Image) as Process values(DestinationPort) as Ports by DestinationIp
+| sort - count
+
+
+########################################
+# PHASE 3 — Malware Discovery: wasp.exe
+########################################
+
+# 3.1 EurekaLog references
+index="main" source="G:\\KCD.csv-2026-4-8 14.52.1.csv" "EurekaLog"
+NOT (DestinationIp IN ("172.16.1.7", "127.0.0.1"))
+| table _time, EventCode, Image, CommandLine, DestinationIp, DestinationPort
+
+# 3.2 wasp.exe process creation
+index="main" source="G:\\KCD.csv-2026-4-8 14.52.1.csv" EventCode=1 Image="*wasp.exe*"
+| table _time, Computer, User, ParentImage, ParentCommandLine, Image, CommandLine, Hashes
+
+
+########################################
+# PHASE 4 — Parent Process: wahiver.exe
+########################################
+
+# 4.1 Trace parent of wasp.exe
+index="main" source="G:\\KCD.csv-2026-4-8 14.52.1.csv" EventCode=1
+(Image="*wahiver.exe*" OR ProcessGuid="{587438d6-17c4-69d6-3264-000000000500}")
+| table _time, Computer, ParentImage, ParentCommandLine, Image, CommandLine, Hashes
+
+# 4.2 wahiver.exe network activity (C2)
+index="main" source="G:\\KCD.csv-2026-4-8 14.52.1.csv" EventCode=3 Image="*wahiver.exe*"
+NOT (DestinationIp IN ("127.0.0.1", "172.16.*"))
+| table _time, Image, DestinationIp, DestinationPort
+| sort _time
+
+# 4.3 Loopback (127.0.0.1) IPC connections
+index="main" source="G:\\KCD.csv-2026-4-8 14.52.1.csv" EventCode=3
+ProcessGuid="{587438d6-5dc6-69d6-e572-000000000500}"
+| table _time, SourceIp, DestinationIp, DestinationPort, DestinationHostname
+
+
+########################################
+# PHASE 5 — Persistence Mechanism
+########################################
+
+# 5.1 Registry persistence (EventCode 13 / 12)
+index="main" source="G:\\KCD.csv-2026-4-8 14.52.1.csv" (EventCode=12 OR EventCode=13)
+(TargetObject="*wahiver*" OR TargetObject="*wasp*" OR Details="*wahiver*" OR Details="*wasp*" OR TargetObject="*WindowsDefend*")
+| table _time, EventCode, User, Image, TargetObject, Details
+
+
+########################################
+# PHASE 6 — Execution Chain Reconstruction
+########################################
+
+# 6.1 Fake svchost.exe (ServiceEx) — service installer
+index="main" source="G:\\KCD.csv-2026-4-8 14.52.1.csv"
+(Image="*\\fonts\\w\\svchost.exe*" OR ParentImage="*\\fonts\\w\\svchost.exe*")
+| table _time, EventCode, User, Image, CommandLine, DestinationIp
+
+# 6.2 Trace go.bat origin (PID 8896)
+index="main" source="G:\\KCD.csv-2026-4-8 14.52.1.csv" EventCode=1
+(ProcessId=8896 OR ProcessGuid="{587438d6-17c2-69d6-2864-000000000500}")
+| table _time, User, ParentImage, ParentCommandLine, Image, CommandLine
+
+# 6.3a go.bat file creation across all droppers
+index="main" source="G:\\KCD.csv-2026-4-8 14.52.1.csv" EventCode=11 TargetFilename="*go.bat*"
+| table _time, User, Image, TargetFilename
+
+# 6.3b File creation under Fonts\w directory
+index="main" source="G:\\KCD.csv-2026-4-8 14.52.1.csv" EventCode=11 TargetFilename="*\\Windows\\Fonts\\w\\*"
+| table _time, Image, TargetFilename, ProcessGuid
+
+# 6.3c Full file-drop timeline by ftp$ account (SFX extraction)
+index="main" source="G:\\KCD.csv-2026-4-8 14.52.1.csv" EventCode=11 User="*ftp*"
+| table _time, Computer, User, Image, TargetFilename
+| sort _time
+
+
+########################################
+# PHASE 7 — Initial Access & Lateral Movement
+########################################
+
+# 7.1 PowerShell stager sessions
+index="main" source="G:\\KCD.csv-2026-4-8 14.52.1.csv" EventCode=1 Image="*powershell.exe*"
+| table _time, User, CommandLine, ParentImage
+
+# 7.1b PowerShell network correlation (download source)
+index="main" source="G:\\KCD.csv-2026-4-8 14.52.1.csv" EventCode=3 Image="*powershell.exe*"
+NOT (DestinationIp IN ("127.0.0.1", "172.16.*"))
+| table _time, Image, DestinationIp, DestinationPort
+
+# 7.2 Windows logon correlation attempt (returned 0 events — Sysmon
+#     export does not include Security-log 4624 events)
+index="main" source="G:\\KCD.csv-2026-4-8 14.52.1.csv" (EventCode=4624 OR EventID=4624)
+(User="*ftp*" OR User="*administrator*" OR TargetUserName="*ftp*" OR TargetUserName="*administrator*")
+| table _time, TargetUserName, LogonType, IpAddress, WorkstationName
+
+# 7.3 Attacker RDP source IPs
+index="main" source="G:\\KCD.csv-2026-4-8 14.52.1.csv" EventCode=3 DestinationPort=3389
+| stats count by SourceIp
+| sort - count
+
+
+########################################
+# PHASE 8 — Defense Evasion
+########################################
+
+# 8.1 Commands spawned from PowerShell (taskkill / sc delete / reg delete etc.)
+index="main" source="G:\\KCD.csv-2026-4-8 14.52.1.csv" EventCode=1 ParentImage="*powershell.exe*"
+| table _time, User, Image, CommandLine
+| sort _time
+
+
+########################################
+# PHASE 9 — Payload Analysis: waspwing.exe
+########################################
+
+# 9.1 Child processes of wasp.exe (headless Chromium browser farm)
+index="main" source="G:\\KCD.csv-2026-4-8 14.52.1.csv" EventCode=1 ParentImage="*wasp.exe*"
+| table _time, User, Image, CommandLine
